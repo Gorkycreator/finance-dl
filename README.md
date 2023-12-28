@@ -1,3 +1,5 @@
+> A note on Gorkycreator's fork: this is a quickly and poorly-modified version of finances-dl. Code will be ugly, since my aim is just to track changes I make to get it up and running.
+
 Python package for scraping personal financial data from financial
 institutions.
 
