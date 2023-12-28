@@ -143,7 +143,9 @@ class Scraper(object):
 
         self.chromedriver_bin = chromedriver_bin
         chrome_options = webdriver.ChromeOptions()
-        chrome_options.binary_location = os.getenv("CHROMEDRIVER_CHROME_BINARY")
+        chromedriver_binary = os.getenv("CHROMEDRIVER_CHROME_BINARY")
+        if chromedriver_binary:
+            chrome_options.binary_location = chromedriver_binary
         log_path = os.getenv("TMPLOG", "/tmp/chromedriver.log")
         service_args = ['--verbose', f'--log-path={log_path}', '--no-sandbox']
         caps = DesiredCapabilities.CHROME
@@ -176,12 +178,29 @@ class Scraper(object):
             driver_class = seleniumrequests.Chrome
         else:
             driver_class = webdriver.Chrome
-        self.driver = driver_class(
-            executable_path=self.chromedriver_bin,
-            chrome_options=chrome_options,
-            desired_capabilities=caps,
-            service_args=service_args,
-        )
+            
+        # https://stackoverflow.com/questions/76550506/typeerror-webdriver-init-got-an-unexpected-keyword-argument-executable-p
+        try:
+            self.driver = driver_class(
+                executable_path=self.chromedriver_bin,
+                chrome_options=chrome_options,
+                desired_capabilities=caps,
+                service_args=service_args,
+            )
+        except:
+            from selenium.webdriver.chrome.service import Service
+            if capture_network_requests:
+                chrome_options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
+            service = Service(
+                executable_path=self.chromedriver_bin,
+                service_args=service_args,
+            )
+            self.driver = driver_class(
+                service=service,
+                options=chrome_options
+            )
+            
+        
         print(' --connect=%s --session-id=%s' %
               (self.driver.command_executor._url, self.driver.session_id))
         signal.signal(signal.SIGINT, original_sigint_handler)
