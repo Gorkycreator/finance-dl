@@ -446,6 +446,9 @@ class Scraper(scrape_lib.Scraper):
         def retrieve_all_order_groups():
             order_select_index = 0
 
+            if self.find_visible_elements(By.XPATH, '//input[@type="password"]'):
+                self.finish_login()
+
             while True:
                 order_filter, = self.wait_and_locate((By.CSS_SELECTOR, AMAZON_ORDER_FILTERS))
                 order_select = Select(order_filter)
