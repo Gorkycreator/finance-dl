@@ -98,6 +98,8 @@ from typing import List, Optional
 
 logger = logging.getLogger('amazon_scrape')
 
+AMAZON_ORDER_FILTERS = '#time-filter, #orderFilter, #timeFilter, #order-filter-dropdown'
+
 
 @dataclasses.dataclass
 class Domain():
@@ -445,7 +447,7 @@ class Scraper(scrape_lib.Scraper):
             order_select_index = 0
 
             while True:
-                order_filter, = self.wait_and_locate((By.CSS_SELECTOR, '#time-filter, #orderFilter'))
+                order_filter, = self.wait_and_locate((By.CSS_SELECTOR, AMAZON_ORDER_FILTERS))
                 order_select = Select(order_filter)
                 num_options = len(order_select.options)
                 if order_select_index >= num_options:
@@ -501,7 +503,8 @@ class Scraper(scrape_lib.Scraper):
                 if (
                     self.domain.grand_total in source or
                     self.domain.grand_total_digital in source or
-                    self.domain.order_cancelled in source
+                    self.domain.order_cancelled in source or
+                    self.domain.pre_order in source
                 ):
                     return source
                 elif 'problem loading this order' in source:

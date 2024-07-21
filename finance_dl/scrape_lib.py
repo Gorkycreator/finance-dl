@@ -281,7 +281,7 @@ class Scraper(object):
             conditions.append(condition)
         return self.wait_and_return(
             *conditions, timeout=timeout,
-            message='Waiting to locate %r' % (locators, ))
+            message=f'Waiting to locate {locators,} on page:\n\t{self.driver.current_url}')
 
     def for_each_frame(self):
         self.driver.switch_to.default_content()
