@@ -162,6 +162,23 @@ class Scraper(scrape_lib.Scraper):
                 pass
         raise NoSuchElementException()
 
+    def find_venmo_mfa(self):
+        for frame in self.for_each_frame():
+            try:
+                return self.driver.find_elements(By.XPATH, '//div[@class="mfa_buttonGroup__hRHb9"]')
+            except NoSuchElementException:
+                pass
+        return None
+
+    def confirm_login(self) -> bool:
+        for frame in self.for_each_frame():
+            try:
+                self.driver.find_elements(By.XPATH, '//a[@href="/pay"]')
+                return True
+            except NoSuchElementException:
+                pass
+        return False
+
     def wait_for(self, condition_function):
         start_time = time.time()
         while time.time() < start_time + 3:
@@ -175,7 +192,15 @@ class Scraper(scrape_lib.Scraper):
 
     def click_through_to_new_page(self, button_text):
         link = self.driver.find_element(By.XPATH, f'//button[@name="{button_text}"]')
-        link.click()
+
+        attempts = 0
+        while attempts < 2:
+            try:
+                link.click()
+                break
+            except StaleElementReferenceException:
+                logger.info('missing element')
+            attempts += 1
 
         def link_has_gone_stale():
             try:
@@ -196,17 +221,28 @@ class Scraper(scrape_lib.Scraper):
         #(username, password), = self.wait_and_return(
         #    self.find_username_and_password_in_any_frame)
         username = self.wait_and_return(self.find_venmo_username)[0][0]
+        logger.info(username)
         try:
-            logger.info('Entering username')
+            logger.info(f'Entering username: {self.credentials['username']}')
             username.send_keys(self.credentials['username'])
             username.send_keys(Keys.ENTER)
         except ElementNotInteractableException:
             # indicates that username already filled in
             logger.info("Skipped")
-        password = self.wait_and_return(self.find_venmo_password)[0][0]
         logger.info('Entering password')
+        time.sleep(.5)  # selenium occasionally goes too fast for the site to load its login page
+        password = self.wait_and_return(self.find_venmo_password)[0][0]
         password.send_keys(self.credentials['password'])
-        self.click_through_to_new_page("Sign in")
+        self.click_through_to_new_page("btnLogin")
+
+        if self.find_venmo_mfa():
+            logger.info("Please enter the MFA code in the browser, then press enter to continue. If the script is running headless, press enter to continue")
+            code = input("Press enter to continue...")  # I'm not sure this always works?
+
+        if not self.confirm_login():
+            raise RuntimeError('Login Failed!')
+            
+
         logger.info('Logged in')
         self.logged_in = True
 
