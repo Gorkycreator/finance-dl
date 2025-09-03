@@ -496,6 +496,13 @@ class Scraper(scrape_lib.Scraper):
     def retrieve_invoices(self, invoice_hrefs):
         for href, order_id in invoice_hrefs:
             logger.info('Downloading invoice for order %r', order_id)
+            
+            # Workaround for broken invoice page https://github.com/jbms/beancount-import/issues/255
+            if not order_id.startswith("D"):
+                WHOLEFOODS_URL = "https://www.amazon.com/gp/legacy/css/summary/print.html/ref=ppx_printOD_rd_dt_b_fresh_fopo_pos_rd?orderID={}"
+                href = WHOLEFOODS_URL.format(order_id)
+                logger.info(f'Patching Wholefoods url: {href}')
+            
             with self.wait_for_page_load():
                 self.driver.get(href)
 
