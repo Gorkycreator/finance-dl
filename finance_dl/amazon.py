@@ -89,6 +89,7 @@ import os
 import datetime
 import dateutil.parser
 import bs4
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import Select
 from selenium.webdriver.common.keys import Keys
@@ -138,7 +139,7 @@ class DOT_COM(Domain):
         super().__init__(
             top_level='com',
             sign_in='Sign In',
-            sign_out='Sign Out',
+            sign_out='Hello, ',
 
             your_orders='Your Orders',
             invoice='Invoice',
@@ -155,7 +156,7 @@ class DOT_COM(Domain):
             pre_order='Pre-order',
 
             digital_order='Digital Order: (.*)',
-            regular_order_placed=r'(?:Subscribe and Save )?Order Placed:\s+([^\s]+ \d+, \d{4})',
+            regular_order_placed=r'(?:Subscribe and Save )?Order Placed:{0,1}\s+([^\s]+ \d+, \d{4})',
 
             digital_orders_menu=True,
             digital_orders_menu_text='Digital Orders',
@@ -277,6 +278,7 @@ class Scraper(scrape_lib.Scraper):
 
     def login(self):
         logger.info('Initiating log in')
+        
         self.driver.get('https://www.amazon.' + self.domain.top_level)
         if self.logged_in:
             return
@@ -303,17 +305,29 @@ class Scraper(scrape_lib.Scraper):
         self.finish_login()
 
     def finish_login(self):
+        try:  # amazon prompts login to view order page, added username input on `.com`. Try/except for more compatibility
+            logger.info('Looking for username link')
+            (username, ), = self.wait_and_return(
+                lambda: self.find_visible_elements(By.XPATH, '//input[@type="email"]')
+            )
+            username.send_keys(self.credentials['username'])
+            username.send_keys(Keys.ENTER)
+        except:
+            logger.info('could not find username input, continuing...')
         logger.info('Looking for password link')
         (password, ), = self.wait_and_return(
             lambda: self.find_visible_elements(By.XPATH, '//input[@type="password"]')
         )
         password.send_keys(self.credentials['password'])
 
-        logger.info('Looking for "remember me" checkbox')
-        (rememberMe, ) = self.wait_and_return(
+        try:  # amazon prompts login to view order page, does not provide "stay logged in" checkbox
+            logger.info('Looking for "remember me" checkbox')
+            (rememberMe, ) = self.wait_and_return(
             lambda: self.find_visible_elements(By.XPATH, '//input[@name="rememberMe"]')[0]
-        )
-        rememberMe.click()
+            )
+            rememberMe.click()
+        except:
+            logger.info('could not find remember me checkbox, continuing...')
 
         with self.wait_for_page_load():
             password.send_keys(Keys.ENTER)
@@ -446,7 +460,9 @@ class Scraper(scrape_lib.Scraper):
         def retrieve_all_order_groups():
             order_select_index = 0
 
-            if self.find_visible_elements(By.XPATH, '//input[@type="password"]'):
+
+
+            if self.find_visible_elements(By.XPATH, '//input[@type="password"]') or self.find_visible_elements(By.XPATH, '//input[@type="email"]'):
                 self.finish_login()
 
             while True:
@@ -493,101 +509,174 @@ class Scraper(scrape_lib.Scraper):
 
         self.retrieve_invoices(invoice_hrefs)
 
-    def retrieve_invoices(self, invoice_hrefs):
+    def retrieve_invoices(self, invoice_hrefs) -> None:
         for href, order_id in invoice_hrefs:
             logger.info('Downloading invoice for order %r', order_id)
-            
-            # Workaround for broken invoice page https://github.com/jbms/beancount-import/issues/255
-            if not order_id.startswith("D"):
-                WHOLEFOODS_URL = "https://www.amazon.com/gp/legacy/css/summary/print.html/ref=ppx_printOD_rd_dt_b_fresh_fopo_pos_rd?orderID={}"
-                href = WHOLEFOODS_URL.format(order_id)
-                logger.info(f'Patching Wholefoods url: {href}')
-            
-            with self.wait_for_page_load():
-                self.driver.get(href)
-
-            # For digital orders, Amazon dynamically generates some of the information.
-            # Wait until it is all generated.
-            def get_source():
-                source = self.driver.page_source
-                if (
-                    self.domain.grand_total in source or
-                    self.domain.grand_total_digital in source or
-                    self.domain.order_cancelled in source or
-                    self.domain.pre_order in source
-                ):
-                    return source
-                elif 'problem loading this order' in source:
-                    raise ValueError(f'Failed to retrieve information for order {order_id}')
-                elif self.find_visible_elements(By.XPATH, '//input[@type="password"]'):
-                    self.finish_login() # fallthrough
-
-                return None
-
-            page_source, = self.wait_and_return(get_source)
-            if self.domain.pre_order in page_source and not self.download_preorder_invoices:
-                    # Pre-orders don't have enough information to download yet. Skip them.
-                    logger.info(f'Skipping pre-order invoice {order_id}')
+            invoice_retrieval_methods = [self.retrieve_legacy_invoice, self.retrieve_order_summary_info]
+            for invoice_method in invoice_retrieval_methods:
+                try:
+                    invoce_method(href, order_id)
                     return
-            if order_id not in page_source:
+                except:
+                    logger.info(f'{invoice_method.__name__} retrieval failed for {order_id}')
+                
+    def retrieve_legacy_invoice(self, href, order_id):
+        # For legacy invoices pre 2025-08-01
+
+        # Workaround for broken invoice page https://github.com/jbms/beancount-import/issues/255
+        LEGACY_INVOICE_PAGE = "https://www.amazon.com/gp/legacy/css/summary/print.html/ref=ppx_printOD_rd_dt_b_fresh_fopo_pos_rd?orderID={}"
+        href = LEGACY_INVOICE_PAGE.format(order_id)
+        logger.info(f'Patching Wholefoods url: {href}')
+            
+        with self.wait_for_page_load():
+            self.driver.get(href)
+
+        # For digital orders, Amazon dynamically generates some of the information.
+        # Wait until it is all generated.
+        def get_source():
+            source = self.driver.page_source
+            if (
+                self.domain.grand_total in source or
+                self.domain.grand_total_digital in source or
+                self.domain.order_cancelled in source or
+                self.domain.pre_order in source or
+                "Total for this Order:" in source
+            ):
+                return source
+            elif 'problem loading this order' in source:
                 raise ValueError(f'Failed to retrieve information for order {order_id}')
+            elif self.find_visible_elements(By.XPATH, '//input[@type="password"]'):
+                self.finish_login() # fallthrough
 
-            # extract order date
-            def get_date(source, order_id):
-                # code blocks taken from beancount-import/amazon-invoice.py
-                soup=bs4.BeautifulSoup(source, 'lxml')
+            return None
 
-                def is_order_placed_node(node):
-                    # order placed information in page header (top left)
-                    m = re.fullmatch(self.domain.regular_order_placed, node.text.strip())
-                    return m is not None
-                
-                def is_digital_order_row(node):
-                    # information in heading of order table
-                    if node.name != 'tr':
-                        return False
-                    m = re.match(self.domain.digital_order, node.text.strip())
-                    if m is None:
-                        return False
-                    try:
-                        self.domain.parse_date(m.group(1))
-                        return True
-                    except:
-                        return False
+        page_source, = self.wait_and_return(get_source)
+        if self.domain.pre_order in page_source and not self.download_preorder_invoices:
+                # Pre-orders don't have enough information to download yet. Skip them.
+                logger.info(f'Skipping pre-order invoice {order_id}')
+                return
+        if order_id not in page_source:
+            raise ValueError(f'Failed to retrieve information for order {order_id}')
 
-                if order_id.startswith('D'):
-                    # digital order
-                    node = soup.find(is_digital_order_row)
-                    regex = self.domain.digital_order
-                else:
-                    # regular order
-                    node = soup.find(is_order_placed_node)
-                    regex = self.domain.regular_order_placed
-                
-                m = re.fullmatch(regex, node.text.strip())
+        # extract order date
+        def get_date(source, order_id):
+            # code blocks taken from beancount-import/amazon-invoice.py
+            soup=bs4.BeautifulSoup(source, 'lxml')
+
+            def is_order_placed_node(node):
+                # order placed information in page header (top left)
+                m = re.fullmatch(self.domain.regular_order_placed, node.text.strip())
+                return m is not None
+            
+            def is_digital_order_row(node):
+                # information in heading of order table
+                if node.name != 'tr':
+                    return False
+                m = re.match(self.domain.digital_order, node.text.strip())
                 if m is None:
-                    return None
-                order_date = self.domain.parse_date(m.group(1))
-                return order_date
+                    return False
+                try:
+                    self.domain.parse_date(m.group(1))
+                    return True
+                except:
+                    return False
 
-            order_date = get_date(page_source, order_id)
-            if order_date is None: 
-                if self.dir_per_year:
-                    raise ValueError(f'Failed to get date for order {order_id}')
-                else:
-                    # date is not necessary, so just log
-                    logger.info(f'Failed to get date for order {order_id}')
+            if order_id.startswith('D'):
+                # digital order
+                node = soup.find(is_digital_order_row)
+                regex = self.domain.digital_order
             else:
-                order_date = order_date.year
-            invoice_path = self.get_invoice_path(order_date, order_id)
-            if not os.path.exists(os.path.dirname(invoice_path)):
-                os.makedirs(os.path.dirname(invoice_path))
-            with atomic_write(
-                    invoice_path, mode='w', encoding='utf-8',
-                    newline='\n', overwrite=True) as f:
-                # Write with Unicode Byte Order Mark to ensure content will be properly interpreted as UTF-8
-                f.write('\ufeff' + page_source)
-            logger.info('  Wrote %s', invoice_path)
+                # regular order
+                node = soup.find(is_order_placed_node)
+                regex = self.domain.regular_order_placed
+            
+            m = re.fullmatch(regex, node.text.strip())
+            if m is None:
+                return None
+            order_date = self.domain.parse_date(m.group(1))
+            return order_date
+
+        order_date = get_date(page_source, order_id)
+        if order_date is None: 
+            if self.dir_per_year:
+                raise ValueError(f'Failed to get date for order {order_id}')
+            else:
+                # date is not necessary, so just log
+                logger.info(f'Failed to get date for order {order_id}')
+        else:
+            order_date = order_date.year
+        invoice_path = self.get_invoice_path(order_date, order_id)
+        if not os.path.exists(os.path.dirname(invoice_path)):
+            os.makedirs(os.path.dirname(invoice_path))
+        with atomic_write(
+                invoice_path, mode='w', encoding='utf-8',
+                newline='\n', overwrite=True) as f:
+            # Write with Unicode Byte Order Mark to ensure content will be properly interpreted as UTF-8
+            f.write('\ufeff' + page_source)
+        logger.info('  Wrote %s', invoice_path)
+
+    def retrieve_order_summary_info(self, href, order_id):
+        with self.wait_for_page_load():
+            self.driver.get(href)
+
+        def get_source():
+            source = self.driver.page_source
+            if (
+                "Total for this Order:" in source
+            ):
+                return source
+            elif 'problem loading this order' in source:
+                raise ValueError(f'Failed to retrieve information for order {order_id}')
+            elif self.find_visible_elements(By.XPATH, '//input[@type="password"]'):
+                self.finish_login() # fallthrough
+
+            return None
+
+        page_source, = self.wait_and_return(get_source)
+        if self.domain.pre_order in page_source and not self.download_preorder_invoices:
+                # Pre-orders don't have enough information to download yet. Skip them.
+                logger.info(f'Skipping pre-order invoice {order_id}')
+                return
+        if order_id not in page_source:
+            raise ValueError(f'Failed to retrieve information for order {order_id}')
+
+        # extract order date
+        def get_date(source):
+            # code blocks taken from beancount-import/amazon-invoice.py
+            soup=bs4.BeautifulSoup(source, 'lxml')
+
+            def is_order_placed_node(node):
+                # order placed information in page header (top left)
+                m = re.fullmatch(self.domain.regular_order_placed, node.text.strip())
+                return m is not None
+            
+            node = soup.find(is_order_placed_node)
+            regex = self.domain.regular_order_placed
+            
+            m = re.fullmatch(regex, node.text.strip())
+            if m is None:
+                return None
+            order_date = self.domain.parse_date(m.group(1))
+            return order_date
+
+        order_date = get_date(page_source)
+        if order_date is None: 
+            if self.dir_per_year:
+                raise ValueError(f'Failed to get date for order {order_id}')
+            else:
+                # date is not necessary, so just log
+                logger.info(f'Failed to get date for order {order_id}')
+        else:
+            order_date = order_date.year
+        invoice_path = self.get_invoice_path(order_date, order_id)
+        if not os.path.exists(os.path.dirname(invoice_path)):
+            os.makedirs(os.path.dirname(invoice_path))
+        with atomic_write(
+                invoice_path, mode='w', encoding='utf-8',
+                newline='\n', overwrite=True) as f:
+            # Write with Unicode Byte Order Mark to ensure content will be properly interpreted as UTF-8
+            f.write('\ufeff' + page_source)
+        logger.info('  Wrote %s', invoice_path)
 
     def run(self):
         self.login()
