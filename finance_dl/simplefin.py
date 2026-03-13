@@ -3,24 +3,76 @@
 This uses the Simplefin API (https://www.simplefin.org/protocol.html) to
 retrieve the data directly.
 
+Initial Setup:
+======
+1. Go to https://beta-bridge.simplefin.org/ and add a new App connection.
+2. Name it to your liking and click `Create Setup Token`
+3. Copy the code to the clipboard
+
+Option 1 - Handle the credentials yourself
+4. From commandline, run `python <path to simplefin_access_token_setup.py> <access token>`.
+5. The command will output the Access URL. Keep this in a safe place.
+6. Supply the Access URL as the `access_url` argument for the configuration dict.
+
+Option 2 - Let the script store it in your machine's keyring
+5. Skip ahead to the configuration section and set the finance_dl config file up.
+   Omit the `access_url` argument.
+6. Run finances-dl with a configuration dictionary that omits `access_url`
+6. When prompted, paste the Setup Token.
+7. The access url will be stored on the machine's keyring.
+
 Configuration:
 ==============
 
 The following keys may be specified as part of the configuration dict:
 
-- `access_url`: Required.  Must be a string formatted according to Simplefin's 
-  specifications. "https://...:...@beta-bridge.simplefin.org/simplefin"
-
-- `output_directory`: Required.  Must be a `str` that specifies the path on the
+- `output_directory`: REQUIRED.  Must be a `str` that specifies the path on the
   local filesystem where the output will be written.  If the directory does not
   exist, it will be created.
 
+- `access_url`: Optional.  Must be a string formatted according to Simplefin's 
+  specifications. "https://...:...@beta-bridge.simplefin.org/simplefin". If this
+  is omitted, you will be prompted for a new setup token.
+
+# TODO: update the code to grab data recursively within the start/end window.
+        have a warning that can be disabled by an additional flag if this is
+        triggered. Additional warning that can't be disabled if it would go over
+        the max API calls.
 - `start_day`: Optional. First day for the date range. Formatted `YYYY-MM-DD`.
   Date range must not exceed {MAX_DAYS} days, per API limitations.
 
 - `end_day`: Optional. Last day for the date range. Formatted `YYYY-MM-DD`.
   Date range must not exceed {MAX_DAYS} days, per API limitations.
 
+- `archive_after_x_days`: Optional. Customize how much data to keep in the "live"
+  transactions file. This ensures data is preserved in an archive file while not
+  bogging down parser (i.e. beancount-import) with all transactions ever made.
+  Only the non-ingested data is relevant to the parser, so set this as low as you're
+  comfortable with to maximize performance. Setting it to 0 disables this feature.
+
+- `pending`: Optional. Query pending transactions from the API. Not recommended
+  because this can create multiple entries for a single transaction, one ID when
+  it is pending, and another when it officially lands.
+
+# TODO: this should be updated to a list. the `account` parameter can be specified
+        multiple times in the api call.
+- `account`: Optional. A string representing the SimpleFin account id. Limits the
+  retrieved data to the given account.
+
+
+  self,
+        access_url: str,
+        output_directory: str,
+        start_day: str = "",
+        end_day: str = "",
+        archive_after_x_days: int = 365,
+        pending: bool = False,
+        account: Optional[str] = None,
+        balances_only: bool = False,
+        ignore_failed_accounts: bool = False,
+        debug: bool = False,
+        headless: bool = True,
+  
 
 
 
@@ -67,7 +119,7 @@ The API expects less than 24 calls per day, will warn at 48, and will block at 9
 [developer docs](https://beta-bridge.simplefin.org/info/developers#Limits) and [this github
 issue](https://github.com/actualbudget/actual/issues/3228#issuecomment-2387241284). To
 respect these constraints, the scraper keeps a file on disk that prevents it from running
-if it is called more than 20 times in a day.
+if it is called more than {RATE_LIMIT} times in a day.
 
 
 
@@ -113,6 +165,7 @@ import pickle
 from typing import Optional
 from pathlib import Path
 import logging
+import finance_dl.simplefin_access_token_setup as sf_token
 
 
 logger = logging.getLogger('simplefin_dl')
@@ -122,22 +175,25 @@ API_URL = "https://beta-bridge.simplefin.org/simplefin/accounts"
 RATE_LIMIT_FILENAME = "rate_limits.pkl"  # {'date': <datetime>, 'counter': <int>}
 RATE_LIMIT = 20
 MAX_DAYS = 45
+DEFAULT_ARCHIVE_AFTER_X_DAYS = 365
 DATA_FILE_NAME = "simplefin_transactions.json"
 ARCHIVE_FILE_NAME = "simplefin_transactions_archive.json"
+DEBUG_FILE_NAME = "simplefin_debug.json"
 
 
 class SimplefinScraper:
     def __init__(
         self,
-        access_url: str,
         output_directory: str,
+        access_url: str = "",
         start_day: str = "",
         end_day: str = "",
-        archive_days: int = 365,
+        archive_after_x_days: int = DEFAULT_ARCHIVE_AFTER_X_DAYS,
         pending: bool = False,
         account: Optional[str] = None,
         balances_only: bool = False,
-        ignore_failed_acounts: bool = False,
+        ignore_failed_accounts: bool = False,
+        debug: bool = False,
         headless: bool = True,
     ) -> None:
         
@@ -146,7 +202,7 @@ class SimplefinScraper:
         self.rate_limit_file = self.output_dir / RATE_LIMIT_FILENAME
         self.ensure_rate_limit_file()
         
-        self.access_url = access_url
+        self.access_url = _retrieve_access_url(access_url)
         
         start_timestamp, end_timestamp = calculate_date_range(format_date(start_day), format_date(end_day))
         
@@ -163,23 +219,32 @@ class SimplefinScraper:
         if account:
             self.params['account'] = account
         
-        self.ignore_failed = ignore_failed_acounts
-        self._archive_cutoff = self.get_archive_timestamp(archive_days)
+        self.ignore_failed = ignore_failed_accounts
+        self._debug = debug
+
+        if archive_after_x_days == 0:
+            self._archive_cutoff = 0
+        else:
+            self._archive_cutoff = self.get_archive_timestamp(archive_after_x_days)
+
         self._sort_function = lambda item: item['posted']
-    
+
     def ensure_rate_limit_file(self) -> None:
         if not self.rate_limit_file.is_file():
             with open(self.rate_limit_file, 'wb') as f:
                 pickle.dump({'date': datetime.today().date(), 'counter': 0}, f)
-    
+
     def verify_under_rate_limits(self) -> bool:
         with open(self.rate_limit_file, 'rb') as f:
             rates = pickle.load(f)
-        counter = rates.get('counter')
-        logger.info(f'Daily Attempts: {counter}/20')
-        if rates.get('date') == datetime.today().date() and counter > 20:
-            return False
-        return True
+        
+        if rates.get('date') != datetime.today().date():
+            counter = 0
+        else:
+            counter = rates.get('counter')
+        
+        logger.info(f'Daily Attempts: {counter}/{RATE_LIMIT}')
+        return not counter > RATE_LIMIT
         
     def update_rate_limits(self) -> None:
         with open(self.rate_limit_file, 'rb') as f:
@@ -215,7 +280,12 @@ class SimplefinScraper:
             params = self.params,
             auth = auth,
         )
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            msg = "Authentication failed. Incorrect or revoked credentials."
+            sf_token.inform_user_about_response_codes(e, logger, msg)
+            raise
         
         logger.info("Data successfully fetched!")
         
@@ -226,7 +296,7 @@ class SimplefinScraper:
             logger.warning("SIMPLEFIN ERRORS DETECTED:")
             for error in data['errors']:
                 logger.warning(error)
-            if not self.ignore_failed:
+            if not self.ignore_failed:  # TODO: this needs to target failed accounts specifically other types of errors should not be ignored
                 raise RuntimeError("Errors detected with registered Simplefin accounts. Please correct before proceeding!")
             else:
                 logger.info("Config set to ignore errors, proceeding...")
@@ -243,7 +313,7 @@ class SimplefinScraper:
         
     def save_new_data(self, new_data, data_file) -> None:
         with open(data_file, 'w') as f:
-            update_data = json.dump(new_data, f, indent=4)
+            json.dump(new_data, f, indent=4)
         
     def account_matches(self, first_account, second_account) -> bool:
         return first_account.get('id') == second_account.get('id')
@@ -270,20 +340,20 @@ class SimplefinScraper:
             archive_account = self._get_account(archive_dict['accounts'], account)
             current_account = self._get_account(current_dict['accounts'], account)
             for txn in account['transactions']:
-                if txn['transacted_at'] < self._archive_cutoff:
-                    self.merge_new_txn(archive_account['transactions'], txn)
-                else:
+                if self._archive_cutoff == 0 or txn['transacted_at'] > self._archive_cutoff:
                     self.merge_new_txn(current_account['transactions'], txn)
+                else:
+                    self.merge_new_txn(archive_account['transactions'], txn)
             archive_account['transactions'].sort(key=self._sort_function)
             current_account['transactions'].sort(key=self._sort_function)
     
-    def update_account_info(self, read_dict, current_dict) -> None:
+    def update_account_balances(self, read_dict, write_dict) -> None:
         update_keys = ('balance', 'available-balance', 'balance-date')
         for read_account in read_dict['accounts']:
-            for account in current_dict['accounts']:
-                if self.account_matches(read_account, account):
+            for write_account in write_dict['accounts']:
+                if self.account_matches(read_account, write_account):
                     for key in update_keys:
-                        account[key] = read_account[key]
+                        write_account[key] = read_account[key]
     
     def _set_up_new_data(self):
         template = {
@@ -321,18 +391,18 @@ class SimplefinScraper:
         
         logger.info(f"Loading archive data from {archive_file}...")
         self.update_txns_from_dicts(archive_data, current_dict, archive_dict)
-        self.update_account_info(archive_data, archive_dict)
-        self.update_account_info(archive_data, current_dict)
+        self.update_account_balances(archive_data, archive_dict)
+        self.update_account_balances(archive_data, current_dict)
         
         logger.info(f"Loading existing data from {data_file}...")
         self.update_txns_from_dicts(file_data, current_dict, archive_dict)
-        self.update_account_info(file_data, archive_dict)
-        self.update_account_info(file_data, current_dict)
+        self.update_account_balances(file_data, archive_dict)
+        self.update_account_balances(file_data, current_dict)
         
         logger.info("Ingesting feched data...")
         self.update_txns_from_dicts(data, current_dict, archive_dict)
-        self.update_account_info(data, current_dict)
-        self.update_account_info(data, archive_dict)
+        self.update_account_balances(data, current_dict)
+        self.update_account_balances(data, archive_dict)
         
         current_dict['errors'] = data.get('errors')
         
@@ -346,14 +416,24 @@ class SimplefinScraper:
     
     def run(self) -> None:
         if not self.verify_under_rate_limits():
-            raise RuntimeError("Simplefin scraper aborted: maximum 20 calls per day.")
+            raise RuntimeError(f"Simplefin scraper aborted: maximum {RATE_LIMIT} calls per day.")
         
         new_data = self.fetch_data()
         self.update_rate_limits()
+
+        if self._debug:
+            logger.info(f"saving debug file...")
+            debug_file = self.output_dir / DEBUG_FILE_NAME
+            self.save_new_data(new_data, debug_file)
         
         self.log_errors(new_data)
         self.save_and_archive_data(new_data)
         
+
+def _retrieve_access_url(url):
+    if not url:
+        url = sf_token.auto_setup()
+    return url
 
 def format_date(input: str) -> Optional[date]:
     try:

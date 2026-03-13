@@ -100,9 +100,11 @@ setuptools.setup(
         'atomicwrites>=1.3.0',
         'jsonschema',
         'python-dateutil',
+        'keyring',
     ],
     tests_require=[
         'pytest',
+        'pytest-mock',
     ],
     cmdclass={
         'sdist': SdistCommand,
