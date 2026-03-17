@@ -32,7 +32,9 @@ The following keys may be specified as part of the configuration dict:
 
 - `access_url`: Optional.  Must be a string formatted according to Simplefin's 
   specifications. "https://...:...@beta-bridge.simplefin.org/simplefin". If this
-  is omitted, you will be prompted for a new setup token.
+  is omitted, you will be prompted for a new setup token, which is stored on
+  your system's keyring. If you need to define multiple configs for different
+  simplefin accounts, this argument must be supplied.
 
 # TODO: update the code to grab data recursively within the start/end window.
         have a warning that can be disabled by an additional flag if this is
@@ -47,69 +49,34 @@ The following keys may be specified as part of the configuration dict:
 - `archive_after_x_days`: Optional. Customize how much data to keep in the "live"
   transactions file. This ensures data is preserved in an archive file while not
   bogging down parser (i.e. beancount-import) with all transactions ever made.
-  Only the non-ingested data is relevant to the parser, so set this as low as you're
-  comfortable with to maximize performance. Setting it to 0 disables this feature.
+  Only the non-ingested transactions are relevant to the parser, so set this as
+  low as you're comfortable with to maximize performance (i.e. 30 days if you're
+  sure you'll update at least once a month). Setting it to `None` disables this
+  feature. NOTE: if `accounts` is specified, this only applies to those accounts.
+  For example, if I already downloaded BANK_1 transactions from 2026-01-01 to
+  2026-03-15 (today) but specify BANK_2 in the config with a 14 day archive window,
+  BANK_2 transactions before 2026-03-02 will go to the archive, but BANK_1's txns
+  will remain in the current file.
 
 - `pending`: Optional. Query pending transactions from the API. Not recommended
-  because this can create multiple entries for a single transaction, one ID when
+  because this can create multiple entries for a single transaction; one ID when
   it is pending, and another when it officially lands.
 
-# TODO: this should be updated to a list. the `account` parameter can be specified
-        multiple times in the api call.
-- `account`: Optional. A string representing the SimpleFin account id. Limits the
-  retrieved data to the given account.
+- `accounts`: Optional. A string or list of strings representing the SimpleFin account
+  ids that should be retrieved. Limits the retrieved data to those accounts. Previously
+  downloaded transactions for other accounts will not be archived or adjusted.
 
+- `balances_only`: Optional. Ignore transactions and holdings, only obtain balances
+  from the API. Not very useful outside of debugging context because empty accounts
+  are scrubbed from the outputs. It will only save balances for accounts that previously
+  stored transactions.
 
-  self,
-        access_url: str,
-        output_directory: str,
-        start_day: str = "",
-        end_day: str = "",
-        archive_after_x_days: int = 365,
-        pending: bool = False,
-        account: Optional[str] = None,
-        balances_only: bool = False,
-        ignore_failed_accounts: bool = False,
-        debug: bool = False,
-        headless: bool = True,
-  
+- `ignore_fialed_accounts`: Optional. SimpleFin accounts can frequently be disconnected.
+  Whether this matters is up to the user. Set this to true to grab whatever data is avail-
+  able without throwing errors if some accounts cannot be reached.
 
-
-
-- `dir_per_year`: Optional. If true (default is false), adds one subdirectory
-  to the output for each year's worth of transactions. Useful for filesystems
-  that struggle with very large directories. Probably not that useful for
-  actually finding anything, given the uselessness of Amazon's order ID
-  scheme.
-
-- `amazon_domain`: Optional.  Specifies the Amazon domain from which to download
-  orders.  Must be one of `'.com'`, `'.co.cuk'` or `'.de'`.  Defaults to
-  `'.com'`.
-
-- `regular`: Optional.  Must be a `bool`.  If `True` (the default), download regular orders.
-   For domains other than `amazon_domain=".com"`, `True` downloads regular AND digital orders.
-
-- `digital`: Optional.  Must be a `bool` or `None`.  If `True`, download digital
-  orders. Effective only for `amazon_domain=".com"`. Defaults to `True` for
-  `amazon_domain=".com"`. For other domains, digital invoices are downloaded
-  tgehter with regular invoices since there is no separate menu on the amazon website.
-
-- `profile_dir`: Optional.  If specified, must be a `str` that specifies the
-  path to a persistent Chrome browser profile to use.  This should be a path
-  used solely for this single configuration; it should not refer to your normal
-  browser profile.  If not specified, a fresh temporary profile will be used
-  each time.
-
-- `order_groups`: Optional.  If specified, must be a list of strings specifying the Amazon
-  order page "order groups" that will be scanned for orders to download. Order groups
-  include years (e.g. '2020'), as well as 'last 30 days' and 'past 3 months'.
-
-- `download_preorder_invoices`: Optional. If specified and True, invoices for
-  preorders (i.e. orders that have not actually been charged yet) will be
-  skipped. Such preorder invoices are not typically useful for accounting
-  since they claim a card was charged even though it actually has not been
-  yet; they get replaced with invoices containing the correct information when
-  the order is actually fulfilled.
+- `debug`: Writes out an additional JSON file that represents the exact data returned by
+  the API query. No transformations or sorting is applied.
 
 
 Usage Details:
@@ -156,13 +123,14 @@ Interactive shell:
 
 """
 
+import re
 import contextlib
 import requests
 from datetime import datetime, date, timedelta
 from urllib.parse import urlparse
 import json
 import pickle
-from typing import Optional
+from typing import Optional, Union
 from pathlib import Path
 import logging
 import finance_dl.simplefin_access_token_setup as sf_token
@@ -179,6 +147,7 @@ DEFAULT_ARCHIVE_AFTER_X_DAYS = 365
 DATA_FILE_NAME = "simplefin_transactions.json"
 ARCHIVE_FILE_NAME = "simplefin_transactions_archive.json"
 DEBUG_FILE_NAME = "simplefin_debug.json"
+DISCONNECTED_ACCOUNT_REGEX = r"Connection to .* may need attention\."
 
 
 class SimplefinScraper:
@@ -188,9 +157,9 @@ class SimplefinScraper:
         access_url: str = "",
         start_day: str = "",
         end_day: str = "",
-        archive_after_x_days: int = DEFAULT_ARCHIVE_AFTER_X_DAYS,
+        archive_after_x_days: Optional[int] = DEFAULT_ARCHIVE_AFTER_X_DAYS,
         pending: bool = False,
-        account: Optional[str] = None,
+        accounts: Union[list[str], str] = list(),
         balances_only: bool = False,
         ignore_failed_accounts: bool = False,
         debug: bool = False,
@@ -216,18 +185,20 @@ class SimplefinScraper:
             'balances-only': balances_only
         }
         
-        if account:
-            self.params['account'] = account
+        self.accounts = accounts
+        if accounts:
+            self.params['account'] = accounts
         
         self.ignore_failed = ignore_failed_accounts
         self._debug = debug
 
-        if archive_after_x_days == 0:
-            self._archive_cutoff = 0
-        else:
-            self._archive_cutoff = self.get_archive_timestamp(archive_after_x_days)
+        self._archive_cutoff = self.get_archive_timestamp(archive_after_x_days)
 
-        self._sort_function = lambda item: item['posted']
+        self._sort_function = lambda item: (
+            item.get('posted', 0),  # for transactions
+            item.get('symbol', ''),  # for holdings
+            item.get('created', 0),  # for holdings
+        )
 
     def ensure_rate_limit_file(self) -> None:
         if not self.rate_limit_file.is_file():
@@ -237,7 +208,7 @@ class SimplefinScraper:
     def verify_under_rate_limits(self) -> bool:
         with open(self.rate_limit_file, 'rb') as f:
             rates = pickle.load(f)
-        
+
         if rates.get('date') != datetime.today().date():
             counter = 0
         else:
@@ -260,12 +231,13 @@ class SimplefinScraper:
         with open(self.rate_limit_file, 'wb') as f:
             pickle.dump(new_data, f)
     
-    def get_archive_timestamp(self, days):
-        today = date.today()
-        archive_datetime = today - timedelta(days=days)
-        archive_date = datetime(archive_datetime.year, archive_datetime.month, archive_datetime.day)
-        return int(archive_date.timestamp())
-    
+    def get_archive_timestamp(self, days) -> Optional[int]:
+        if days:
+            today = date.today()
+            archive_datetime = today - timedelta(days=days)
+            archive_date = datetime(archive_datetime.year, archive_datetime.month, archive_datetime.day)
+            return int(archive_date.timestamp())
+        
     def fetch_data(self) -> dict:
         logger.info(f"Attempting to fetch data from {API_URL}")
         
@@ -292,14 +264,26 @@ class SimplefinScraper:
         return response.json()
     
     def log_errors(self, data: dict) -> None:
-        if data.get('errors'):
-            logger.warning("SIMPLEFIN ERRORS DETECTED:")
-            for error in data['errors']:
-                logger.warning(error)
-            if not self.ignore_failed:  # TODO: this needs to target failed accounts specifically other types of errors should not be ignored
-                raise RuntimeError("Errors detected with registered Simplefin accounts. Please correct before proceeding!")
+        if not data.get('errors'):
+            return
+        
+        critical_errors = list()
+
+        if self.ignore_failed:
+            logger.info("Ignore failed is enabled. Disconnected accounts will not be flagged as critical errors.")
+
+        logger.info("SIMPLEFIN ERRORS DETECTED:")
+
+        for error in data['errors']:
+            disconnected_account_pattern_match = re.search(DISCONNECTED_ACCOUNT_REGEX, error)
+            if disconnected_account_pattern_match and self.ignore_failed:
+                logger.info(error)
             else:
-                logger.info("Config set to ignore errors, proceeding...")
+                logger.error(error)
+                critical_errors.append(error)
+
+        if critical_errors:
+            raise RuntimeError("Errors detected with registered Simplefin accounts. Please correct before proceeding!")
     
     def retrieve_old_data(self, data_file) -> dict:
         if data_file.is_file():
@@ -330,30 +314,33 @@ class SimplefinScraper:
                 return account_candidate
         return self._set_up_new_account(data, account)
     
-    def update_txns_from_dicts(self, read_dict, current_dict, archive_dict) -> None:
-        """
-        takes in a simplefin JSON dict along with two other dictionaries representing current and archivable data 
-        
-        modifies the current and archivable data dicts based on the read_dict
-        """
+    def update_accounts_in_dicts(self, read_dict, current_dict, archive_dict) -> None:
         for account in read_dict['accounts']:
+            if self.accounts and account['id'] not in self.accounts:
+                continue
             archive_account = self._get_account(archive_dict['accounts'], account)
             current_account = self._get_account(current_dict['accounts'], account)
-            for txn in account['transactions']:
-                if self._archive_cutoff == 0 or txn['transacted_at'] > self._archive_cutoff:
-                    self.merge_new_txn(current_account['transactions'], txn)
-                else:
-                    self.merge_new_txn(archive_account['transactions'], txn)
-            archive_account['transactions'].sort(key=self._sort_function)
-            current_account['transactions'].sort(key=self._sort_function)
+            self.update_txns_for_accounts(account, current_account, archive_account, 'transactions')
+            self.update_txns_for_accounts(account, current_account, archive_account, 'holdings')
+            self.update_balance_for_account(account, current_account)
+            self.update_balance_for_account(account, archive_account)
+
+    def update_txns_for_accounts(self, read_account, current_account, archive_account, key):
+        """
+        key: 'transactions' or 'holdings'
+        """
+        for txn in read_account[key]:
+            txn_date = txn.get('transacted_at') or txn.get('created')
+            if self._archive_cutoff is None or txn_date > self._archive_cutoff:
+                self.merge_new_txn(current_account[key], txn)
+            else:
+                self.merge_new_txn(archive_account[key], txn)
+        archive_account[key].sort(key=self._sort_function)
+        current_account[key].sort(key=self._sort_function)
     
-    def update_account_balances(self, read_dict, write_dict) -> None:
-        update_keys = ('balance', 'available-balance', 'balance-date')
-        for read_account in read_dict['accounts']:
-            for write_account in write_dict['accounts']:
-                if self.account_matches(read_account, write_account):
-                    for key in update_keys:
-                        write_account[key] = read_account[key]
+    def update_balance_for_account(self, read_account, write_account):
+        for key in ('balance', 'available-balance', 'balance-date'):
+            write_account[key] = read_account[key]
     
     def _set_up_new_data(self):
         template = {
@@ -377,9 +364,19 @@ class SimplefinScraper:
     def _scrub_empty_accounts(self, data):
         data['accounts'] = [acc for acc in data['accounts'] if acc.get('transactions') or acc.get('holdings')]
             
-    
+    def _restore_other_accounts(self, read_dict, write_dict):
+        """
+        All data is written to {DATA_FILE_NAME} and {ARCHIVE_FILE_NAME}, no matter how many
+        SimpleFin configurations are defined in the finance-dl config file. This allows the
+        user to use the same json files, but define multiple configurations for specific accounts.
+        Useful if the user wants some accounts to keep longer archive windows than others, and/or
+        to query the API for some accounts less frequently.
+        """
+        for account in read_dict['accounts']:
+            if account['id'] not in self.accounts:
+                write_dict['accounts'].append(account)
+
     def save_and_archive_data(self, data) -> None:
-        # TODO: currently only transactions are supported--add support for holdings
         data_file = self.output_dir / DATA_FILE_NAME
         archive_file = self.output_dir / ARCHIVE_FILE_NAME
         
@@ -390,22 +387,20 @@ class SimplefinScraper:
         archive_dict = self._set_up_new_data()
         
         logger.info(f"Loading archive data from {archive_file}...")
-        self.update_txns_from_dicts(archive_data, current_dict, archive_dict)
-        self.update_account_balances(archive_data, archive_dict)
-        self.update_account_balances(archive_data, current_dict)
+        self.update_accounts_in_dicts(archive_data, current_dict, archive_dict)
         
         logger.info(f"Loading existing data from {data_file}...")
-        self.update_txns_from_dicts(file_data, current_dict, archive_dict)
-        self.update_account_balances(file_data, archive_dict)
-        self.update_account_balances(file_data, current_dict)
+        self.update_accounts_in_dicts(file_data, current_dict, archive_dict)
         
         logger.info("Ingesting feched data...")
-        self.update_txns_from_dicts(data, current_dict, archive_dict)
-        self.update_account_balances(data, current_dict)
-        self.update_account_balances(data, archive_dict)
+        self.update_accounts_in_dicts(data, current_dict, archive_dict)
         
         current_dict['errors'] = data.get('errors')
         
+        if self.accounts:
+            self._restore_other_accounts(file_data, current_dict)
+            self._restore_other_accounts(archive_data, archive_dict)
+
         self._scrub_empty_accounts(current_dict)
         self._scrub_empty_accounts(archive_dict)
         
